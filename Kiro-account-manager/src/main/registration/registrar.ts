@@ -88,7 +88,7 @@ export class Registrar {
 
   /** TLS SessionClient 选项 */
   private get sessionOpts() {
-    const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || getSystemProxy() || undefined
+    const proxyUrl = this.getProxyUrl()
     return {
       tlsClientIdentifier: 'chrome_144' as const,
       timeoutSeconds: 60,
@@ -96,6 +96,10 @@ export class Registrar {
       insecureSkipVerify: true,
       proxyUrl
     }
+  }
+
+  private getProxyUrl(): string | undefined {
+    return process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || getSystemProxy() || undefined
   }
 
   /** 初始化 TLS 客户端 */
@@ -157,9 +161,7 @@ export class Registrar {
    * 静态资源不需要 TLS 指纹伪装，直接用 Node/undici fetch 即可。
    */
   private async fetchAppJS(url: string, init?: RequestInit): Promise<Response> {
-    const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy
-      || process.env.HTTP_PROXY || process.env.http_proxy
-      || getSystemProxy() || undefined
+    const proxyUrl = this.getProxyUrl()
     if (proxyUrl) {
       const agent = new ProxyAgent({ uri: proxyUrl, requestTls: { rejectUnauthorized: false } })
       const resp = await undiciFetch(url, { ...(init as UndiciRequestInit), dispatcher: agent })
@@ -173,6 +175,26 @@ export class Registrar {
     return err.message.includes('EOF')
       || err.message.includes('no tls client for modification check')
       || err.message.includes('failed to modify existing client')
+  }
+
+  private async logOutboundIp(): Promise<void> {
+    const proxyUrl = this.getProxyUrl()
+    const target = 'https://api.ipify.org?format=json'
+    try {
+      const init: UndiciRequestInit = {
+        method: 'GET',
+        signal: AbortSignal.timeout(8000)
+      }
+      if (proxyUrl) {
+        init.dispatcher = new ProxyAgent({ uri: proxyUrl, requestTls: { rejectUnauthorized: false } })
+      }
+      const resp = await undiciFetch(target, init)
+      const data = await resp.json() as { ip?: string }
+      const label = proxyUrl ? '代理出口 IP' : '直连出口 IP'
+      this.log(`[Network] ${label}: ${data.ip || 'unknown'}`)
+    } catch (err) {
+      this.log(`[Network] 出口 IP 获取失败: ${err instanceof Error ? err.message : String(err)}`)
+    }
   }
 
   /** 清理 TLS 客户端资源 */
@@ -1060,6 +1082,7 @@ export class Registrar {
   async run(): Promise<RegistrationResult> {
     try {
       await this.initTlsClient()
+      await this.logOutboundIp()
       await refreshAppJSConfig((url, init) => this.fetchAppJS(url, init))
       await this.rebuildTlsClient()
 
@@ -1153,6 +1176,7 @@ export class Registrar {
   async runManualPhase1(): Promise<{ success: boolean; error?: string }> {
     try {
       await this.initTlsClient()
+      await this.logOutboundIp()
       await refreshAppJSConfig((url, init) => this.fetchAppJS(url, init))
       await this.rebuildTlsClient()
 
