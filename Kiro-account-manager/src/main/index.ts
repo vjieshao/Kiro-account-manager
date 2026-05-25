@@ -169,21 +169,66 @@ interface OidcRefreshResult {
 const KIRO_AUTH_ENDPOINT = 'https://prod.us-east-1.auth.desktop.kiro.dev'
 
 // ============ 代理设置 ============
+let currentHttpProxyUrl = ''
 
 // 设置代理环境变量
 function applyProxySettings(enabled: boolean, url: string): void {
   if (enabled && url) {
+    currentHttpProxyUrl = url
     process.env.HTTP_PROXY = url
     process.env.HTTPS_PROXY = url
     process.env.http_proxy = url
     process.env.https_proxy = url
     console.log(`[Proxy] Enabled: ${url}`)
   } else {
+    currentHttpProxyUrl = ''
     delete process.env.HTTP_PROXY
     delete process.env.HTTPS_PROXY
     delete process.env.http_proxy
     delete process.env.https_proxy
     console.log('[Proxy] Disabled')
+  }
+}
+
+function shouldRetryOidcWithoutProxy(url: string, error: unknown): boolean {
+  if (!currentHttpProxyUrl) return false
+  try {
+    const parsed = new URL(url)
+    if (!/^oidc\.[a-z0-9-]+\.amazonaws\.com$/.test(parsed.hostname)) return false
+  } catch {
+    return false
+  }
+
+  const message = error instanceof Error ? error.message : String(error)
+  const lower = message.toLowerCase()
+  return [
+    'proxy responded with non 200 code: 400',
+    '400 bad request',
+    'proxy connect',
+    'connect tunnel',
+    'failed to connect to',
+    'could not connect to server',
+    'econnrefused',
+    'socket hang up'
+  ].some((marker) => lower.includes(marker))
+}
+
+async function fetchOidcWithProxyFallback(url: string, init: UndiciRequestInit): Promise<Response> {
+  if (!currentHttpProxyUrl) {
+    return undiciFetch(url, init) as unknown as Promise<Response>
+  }
+
+  const proxiedInit: UndiciRequestInit = {
+    ...init,
+    dispatcher: new ProxyAgent(currentHttpProxyUrl)
+  }
+
+  try {
+    return await undiciFetch(url, proxiedInit) as unknown as Response
+  } catch (error) {
+    if (!shouldRetryOidcWithoutProxy(url, error)) throw error
+    console.warn(`[OIDC] Proxy request failed, retrying without proxy: ${error instanceof Error ? error.message : error}`)
+    return undiciFetch(url, init) as unknown as Promise<Response>
   }
 }
 
@@ -483,7 +528,7 @@ async function refreshOidcToken(
   }
   
   try {
-    const response = await fetch(url, {
+    const response = await fetchOidcWithProxyFallback(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
@@ -619,7 +664,7 @@ async function ssoDeviceAuth(bearerToken: string, region: string = 'us-east-1'):
   // Step 1: 注册 OIDC 客户端
   console.log('[SSO] Step 1: Registering OIDC client...')
   try {
-    const regRes = await fetch(`${oidcBase}/client/register`, {
+    const regRes = await fetchOidcWithProxyFallback(`${oidcBase}/client/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -642,7 +687,7 @@ async function ssoDeviceAuth(bearerToken: string, region: string = 'us-east-1'):
   // Step 2: 发起设备授权
   console.log('[SSO] Step 2: Starting device authorization...')
   try {
-    const devRes = await fetch(`${oidcBase}/device_authorization`, {
+    const devRes = await fetchOidcWithProxyFallback(`${oidcBase}/device_authorization`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ clientId, clientSecret, startUrl })
@@ -690,7 +735,7 @@ async function ssoDeviceAuth(bearerToken: string, region: string = 'us-east-1'):
   console.log('[SSO] Step 5: Accepting user code...')
   let deviceContext: { deviceContextId?: string; clientId?: string; clientType?: string } | null = null
   try {
-    const acceptRes = await fetch(`${oidcBase}/device_authorization/accept_user_code`, {
+    const acceptRes = await fetchOidcWithProxyFallback(`${oidcBase}/device_authorization/accept_user_code`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Referer': 'https://view.awsapps.com/' },
       body: JSON.stringify({ userCode, userSessionId: deviceSessionToken })
@@ -707,7 +752,7 @@ async function ssoDeviceAuth(bearerToken: string, region: string = 'us-east-1'):
   if (deviceContext?.deviceContextId) {
     console.log('[SSO] Step 6: Approving authorization...')
     try {
-      const approveRes = await fetch(`${oidcBase}/device_authorization/associate_token`, {
+      const approveRes = await fetchOidcWithProxyFallback(`${oidcBase}/device_authorization/associate_token`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Referer': 'https://view.awsapps.com/' },
         body: JSON.stringify({
@@ -735,7 +780,7 @@ async function ssoDeviceAuth(bearerToken: string, region: string = 'us-east-1'):
     await new Promise(r => setTimeout(r, interval * 1000))
     
     try {
-      const tokenRes = await fetch(`${oidcBase}/token`, {
+      const tokenRes = await fetchOidcWithProxyFallback(`${oidcBase}/token`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -3491,7 +3536,7 @@ app.whenReady().then(async () => {
     try {
       // Step 1: 注册 OIDC 客户端
       console.log('[Login] Step 1: Registering OIDC client...')
-      const regRes = await fetch(`${oidcBase}/client/register`, {
+      const regRes = await fetchOidcWithProxyFallback(`${oidcBase}/client/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -3515,7 +3560,7 @@ app.whenReady().then(async () => {
 
       // Step 2: 发起设备授权
       console.log('[Login] Step 2: Starting device authorization...')
-      const authRes = await fetch(`${oidcBase}/device_authorization`, {
+      const authRes = await fetchOidcWithProxyFallback(`${oidcBase}/device_authorization`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ clientId, clientSecret, startUrl })
@@ -3572,7 +3617,7 @@ app.whenReady().then(async () => {
     const { clientId, clientSecret, deviceCode } = currentLoginState
 
     try {
-      const tokenRes = await fetch(`${oidcBase}/token`, {
+      const tokenRes = await fetchOidcWithProxyFallback(`${oidcBase}/token`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -3676,7 +3721,7 @@ app.whenReady().then(async () => {
     try {
       // Step 1: 注册 OIDC 客户端 (使用 authorization_code grant type)
       console.log('[Login] Step 1: Registering OIDC client...')
-      const regRes = await fetch(`${oidcBase}/client/register`, {
+      const regRes = await fetchOidcWithProxyFallback(`${oidcBase}/client/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -3771,7 +3816,7 @@ app.whenReady().then(async () => {
             
             // 自动完成 token 交换
             try {
-              const tokenRes = await fetch(`${oidcBase}/token`, {
+              const tokenRes = await fetchOidcWithProxyFallback(`${oidcBase}/token`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
